@@ -172,8 +172,13 @@ def now_ms():
 def _cur_user():
     """当前会话用户 dict。事务内直接读已加载的 db（不加锁）；否则走 store.current_user。"""
     db = _CTX.get('db')
+    try:
+        import store
+        _suid = store.get_session_uid()
+    except Exception:
+        _suid = ''
     if isinstance(db, dict):
-        cid = str(db.get('currentUid') or db.get('lastUser') or '')
+        cid = str(_suid or db.get('currentUid') or db.get('lastUser') or '')
         u = db.get('users', {}).get(cid) if cid else None
         if isinstance(u, dict): return u
         return {}
@@ -185,7 +190,13 @@ def _cur_user():
         return {}
 
 def uid(req=None):
-    """当前游戏会话用户 id（字符串），取不到返回 ''。"""
+    """当前游戏会话用户 id（字符串），取不到返回 ''。优先用本连接绑定 uid。"""
+    try:
+        import store
+        _suid = store.get_session_uid()
+        if _suid: return str(_suid)
+    except Exception:
+        pass
     db = _CTX.get('db')
     if isinstance(db, dict):
         return str(db.get('currentUid') or db.get('lastUser') or '')

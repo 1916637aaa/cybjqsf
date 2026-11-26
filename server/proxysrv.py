@@ -19,7 +19,7 @@
 注意：只放行「知名大厂后缀」这一份白名单，且仅做 TCP 转发，不做 MITM。
 """
 
-import socket, threading, sys, os, logging, select, re, ipaddress
+import socket, threading, sys, os, logging, select, re, ipaddress, time
 
 LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 TARGET_HTTPS = ('127.0.0.1', 443)    # nginx，按 SNI 分发
@@ -27,13 +27,23 @@ TARGET_HTTP = ('127.0.0.1', 8443)    # Flask 后端
 WS_TARGET   = ('127.0.0.1', 80)      # /agent WebSocket (经 nginx 80)
 
 # ---- 私服域名：走本机 nginx（绝不解析真实域名） ----
-# 本机服务器 IP：由 conf/privsrv.env 的 PRIVSRV_IP 注入（安装时自动写入你自己的 IP）。
-# 不写死任何特定 IP，换服务器只需改配置、无需改代码。
-MY_IP = os.environ.get('PRIVSRV_IP', '').strip()
 LOCAL_SUFFIX = ('hortorgames.com', 'hortorinteractive.com')
+# 本机公网 IP 从 conf/privsrv.env 注入，不写死任何特定地址。
 ALLOW_EXACT = {'127.0.0.1', 'localhost'}
-if MY_IP:
-    ALLOW_EXACT.add(MY_IP)
+_my_ip = os.environ.get('PRIVSRV_IP', '').strip()
+if _my_ip:
+    ALLOW_EXACT.add(_my_ip)
+_LOCAL_SRC = ALLOW_EXACT | {'::1'}
+
+# ---- 域名严格模式（默认开）----
+#   只放行与私服/游戏「有关」的域名（LOCAL 私服域名），其余 CONNECT 一律拒绝，
+#   从根上掐掉把本机当成免费开放代理的滥用（境外受限站点、Google/GitHub、广告聚合等）。
+#   关闭方法：PROXY_STRICT=0   —— 退回「放行全部第三方」的宽松旧行为。
+PROXY_STRICT = os.environ.get('PROXY_STRICT', 'true').lower() not in (
+    '0', 'false', 'no', 'off')
+
+# 严格模式下，若确有少量第三方域名需放行，用 PROXY_REMOTE_ALLOW 填写（逗号分隔后缀），默认空。
+REMOTE_ALLOW = {x.strip().lower() for x in os.environ.get('PROXY_REMOTE_ALLOW', '').split(',') if x.strip()}
 
 # ---- 第三方域名后缀白名单 ----
 # 来源：APK 原生库(.so/dex/xml)硬编码域名 + 线上 requests/代理日志里
@@ -110,7 +120,24 @@ def is_passthru(host):
 
 
 def allowed(host):
-    return is_local(host) or is_passthru(host)
+    """返回 (是否放行, 原因)。域名严格模式只放行「有关域名」。"""
+    h = _norm(host)
+    if is_local(h):
+        return True, 'LOCAL'
+    if not PROXY_STRICT:                 # 宽松兼容：放行全部第三方
+        return is_passthru(h), 'PASSTHRU'
+    if h in REMOTE_ALLOW:                # 严格模式下的极小放行例外
+        return True, 'REMOTE_ALLOW'
+    return False, 'DENY'
+
+# 拒绝日志节流：同一被拒域名每 300 秒最多记一条 warning，避免 syslog 被刷爆
+_deny_ts = {}
+
+def _throttled_deny(host, src):
+    now = time.time()
+    if now - _deny_ts.get(host, 0) > 300:
+        _deny_ts[host] = now
+        log.warning('拒绝 CONNECT %s (来自 %s) —— 非有关域名（严格模式）' % (host, src))
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
@@ -165,7 +192,7 @@ def _load_wl():
 def handle(client, addr):
     _ips, _strict = _load_wl()
     _src = addr[0]
-    if _strict and _src not in _ips and _src not in ('127.0.0.1', '::1') and _src != MY_IP:
+    if _strict and _src not in _ips and _src not in _LOCAL_SRC:
         log.warning('拒绝来源 IP %s —— 不在授信白名单' % _src)
         try:
             client.close()
@@ -193,8 +220,9 @@ def handle(client, addr):
             except Exception:
                 port = 443
 
-            if not allowed(host):
-                log.warning('拒绝 CONNECT %s (来自 %s) —— 非白名单' % (host, addr[0]))
+            ok, why = allowed(host)
+            if not ok:
+                _throttled_deny(host, addr[0])
                 client.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n')
                 client.close()
                 return
@@ -205,15 +233,33 @@ def handle(client, addr):
                 #   443   -> nginx HTTPS（按 SNI 分发到 agentsrv）
                 #   38443 -> 后台管理面板（privsrv-admin，HTTPS 自签）
                 #   其它  -> nginx:443（默认）
-                _lp = {80: 80, 443: 443, 38443: 38443}.get(port, 443)
-                log.info('LOCAL     CONNECT %s:%d (来自 %s) -> 127.0.0.1:%d'
-                         % (host, port, addr[0], _lp))
+                # 443 走专用 9443(proxy_protocol)，把真实公网IP在TCP层交给nginx
+                _use_pp = (port == 443)
+                _lp = {80: 80, 443: 9443, 38443: 38443}.get(port, 443)
+                log.info('LOCAL     CONNECT %s:%d (来自 %s) -> 127.0.0.1:%d pp=%s'
+                         % (host, port, addr[0], _lp, _use_pp))
                 try:
                     remote = socket.create_connection(('127.0.0.1', _lp), timeout=15)
+                    if _use_pp:
+                        try:
+                            _cport = addr[1] if len(addr) > 1 else 0
+                            _pp = 'PROXY TCP4 %s 127.0.0.1 %d 9443\r\n' % (addr[0], _cport)
+                            remote.sendall(_pp.encode('ascii'))
+                        except Exception as _ppe:
+                            log.warning('PP头发送失败: %s' % _ppe)
                 except Exception as e:
-                    log.warning('连私服后端失败: %s' % e)
-                    client.close()
-                    return
+                    if _use_pp:
+                        try:
+                            remote = socket.create_connection(('127.0.0.1', 443), timeout=15)
+                            log.warning('9443不可用,回退443(无PP)')
+                        except Exception as e2:
+                            log.warning('连私服后端失败: %s' % e2)
+                            client.close()
+                            return
+                    else:
+                        log.warning('连私服后端失败: %s' % e)
+                        client.close()
+                        return
             else:
                 # 第三方：直连真实 IP，纯 TCP 隧道，TLS 端到端不解密
                 log.info('PASSTHRU  CONNECT %s:%d (来自 %s) -> 真实互联网' % (host, port, addr[0]))
@@ -230,6 +276,21 @@ def handle(client, addr):
             is_ws = 'upgrade: websocket' in head.lower()
             m = re.search(r'(?im)^Host:\s*([^\s:]+)', head)
             hhost = m.group(1) if m else ''
+            # 绝对 URL 目标（GET http://host/path）里的域名也要参与判定
+            t_host = ''
+            _m2 = re.match(r'(?i)^https?://([^/:]+)', target)
+            if _m2:
+                t_host = _m2.group(1).lower()
+            # 严格模式对明文 HTTP 同样生效：复用 allowed()（与 CONNECT 分支同源判定），
+            # 非有关域名一律 403，堵住「CONNECT 被挡后改用明文 HTTP 继续当免费代理」的绕过口子。
+            # Host 头与绝对 URL 里的域名都要校验，防止二者不一致时绕过。
+            if PROXY_STRICT:
+                for _bad in (t_host, hhost):
+                    if _bad and not allowed(_bad)[0]:
+                        _throttled_deny(_bad, addr[0])
+                        client.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n')
+                        client.close()
+                        return
 
             if is_ws:
                 log.info('WS  %s %s  (来自 %s)' % (method, target[:60], addr[0]))
@@ -239,13 +300,17 @@ def handle(client, addr):
                     log.warning('连 agent 失败: %s' % e)
                     client.close()
                     return
-            elif hhost and is_passthru(hhost) and not is_local(hhost):
+            elif hhost and not is_local(hhost) and (
+                (hhost in REMOTE_ALLOW or t_host in REMOTE_ALLOW) or
+                (not PROXY_STRICT and is_passthru(hhost))
+            ):
+                _dst = t_host or hhost
                 log.info('PASSTHRU  HTTP %s %s (来自 %s) -> 真实互联网'
                          % (method, target[:50], addr[0]))
                 try:
-                    remote = socket.create_connection((hhost, 80), timeout=15)
+                    remote = socket.create_connection((_dst, 80), timeout=15)
                 except Exception as e:
-                    log.warning('连第三方 HTTP 失败 %s: %s' % (hhost, e))
+                    log.warning('连第三方 HTTP 失败 %s: %s' % (_dst, e))
                     client.close()
                     return
             else:
@@ -256,6 +321,20 @@ def handle(client, addr):
                     log.warning('连后端失败: %s' % e)
                     client.close()
                     return
+            # === [IPLOG] 注入真实来源 IP 供后端登录日志使用 ===
+            try:
+                if is_ws or is_local(hhost) or is_local(t_host):
+                    _h, _s, _b = buf.partition(b'\r\n\r\n')
+                    if _s and _h:
+                        _ls = [x for x in _h.split(b'\r\n')
+                               if not x.lower().startswith((b'x-real-ip:', b'x-forwarded-for:'))]
+                        _ipb = addr[0].encode('ascii', 'ignore')
+                        _ls = [_ls[0], b'X-Real-IP: ' + _ipb,
+                               b'X-Forwarded-For: ' + _ipb] + _ls[1:]
+                        buf = b'\r\n'.join(_ls) + b'\r\n\r\n' + _b
+            except Exception:
+                pass
+            # === [/IPLOG] ===
             remote.sendall(buf)
         tunnel(client, remote)
     except Exception as e:

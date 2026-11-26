@@ -107,6 +107,28 @@ def h_delconf(req):
     F.mutate(fn)
     return F.payload(c, ids=[F.as_int(x, 0) for x in ids])
 
+def _bin_bytes(v):
+    """把客户端上传的二进制 content 还原为字节。兼容 bytes/list/base64/str。"""
+    import base64 as _b64
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v)
+    if isinstance(v, list):
+        try:
+            return bytes(int(x) & 255 for x in v)
+        except Exception:
+            return b''
+    if isinstance(v, str):
+        try:
+            return _b64.b64decode(v)
+        except Exception:
+            pass
+        try:
+            return v.encode('latin1')
+        except Exception:
+            return b''
+    return b''
+
+
 # ============================ 作品发布 ============================
 @F.register('game_publishgame', 'game_uploadreleasegame', 'game_uploadgoods')
 def h_publish(req):
@@ -114,6 +136,40 @@ def h_publish(req):
     u = F.uid()
     gid = F.first(req, None, 'id', 'gameId')
     name = str(F.first(req, '我的作品', 'name') or '我的作品')[:40]
+    # 作品/商品名敏感词检测（发布即公开可见）
+    try:
+        import agentsrv as _asrv
+        _pub_hits = _asrv.sensitive_check(name)
+        if _pub_hits:
+            return F.payload(c, id=0, code=1, msg='名称含敏感词，请修改后再发布',
+                             result=False, success=False, sensitiveWords=_pub_hits)
+    except Exception:
+        pass
+    # ---- 发布链路：保存客户端上传的游戏工程 .bin，让作品真正「可玩」----
+    # 客户端发布流程：bon.encode(工程对象)->gzip -> Game_UploadReleaseGame{dataVersion,content}
+    #   -> 拿到 cdnUrl -> Game_PublishGame{gameDataCdnUrl:cdnUrl,...}
+    # 原实现把上传当发布处理、content 丢弃、cdnUrl 写死空 -> 作品能显示但不能玩。
+    # 这里补上：上传时把 content 落盘为 nginx 可下载的 .bin，返回纯文件名作 cdnUrl；
+    #           发布时把 gameDataCdnUrl 写进作品记录，详情回包即可原样下发。
+    saved_cdn = ''
+    if c == 'game_uploadreleasegame':
+        content = F.first(req, None, 'content')
+        raw = _bin_bytes(content)
+        if raw:
+            import os as _os, uuid as _uuid
+            d = '/opt/privsrv/uploads/cover'
+            try:
+                _os.makedirs(d, exist_ok=True)
+                # 纯文件名，客户端 downLoadBin 拼 fileCDN(/GameCreator-byte/) 下载；
+                # nginx 已把该前缀 alias 到 uploads/cover/。
+                name = 'game_%s_%s.bin' % (str(F.as_int(gid, 0)), _uuid.uuid4().hex[:10])
+                with open(_os.path.join(d, name), 'wb') as _f:
+                    _f.write(raw)
+                saved_cdn = name
+                F.log('UPLOAD_GAME_BIN', name, len(raw), 'bytes')
+            except Exception as _e:
+                F.log('UPLOAD_GAME_BIN_ERR', repr(_e))
+
     def fn(ft, db):
         if c == 'game_uploadgoods':
             nid = F.next_id(ft, 'goods')
@@ -125,6 +181,8 @@ def h_publish(req):
             return nid
         nid = F.as_int(gid, 0) if gid else F.next_id(ft, 'game')
         games = ft.setdefault('games', [])
+        # 发布命令带来的 cdnUrl：优先用它；上传命令则用本次落盘生成的
+        game_cdn = str(F.first(req, '', 'gameDataCdnUrl') or saved_cdn or '')
         rec = {
             'id': nid, 'name': name, 'iconTextureName': str(F.first(req, 'demo1.png', 'iconTextureName') or 'demo1.png'),
             'rank': len(games) + 13, 'thumbCnt': 0, 'collectionCnt': 0,
@@ -132,7 +190,12 @@ def h_publish(req):
             'openCreativeGame': False, 'lastPublishTime': F.now_ms(),
             '_uid': str(u), '_stamp': F.now_ms(), 'status': 1,
         }
-        # 同 id 覆盖（重复发布 = 更新）
+        if game_cdn:
+            rec['gameDataCdnUrl'] = game_cdn
+        # 同 id 覆盖（重复发布 = 更新）；保留旧的 gameDataCdnUrl 避免更新时丢失
+        _old = next((x for x in games if str(x.get('id')) == str(nid)), None)
+        if _old and _old.get('gameDataCdnUrl') and not game_cdn:
+            rec['gameDataCdnUrl'] = _old['gameDataCdnUrl']
         games[:] = [g for g in games if str(g.get('id')) != str(nid)]
         games.append(rec)
         # 累计作品数
@@ -141,7 +204,7 @@ def h_publish(req):
             us[str(u)]['workCount'] = len([g for g in games if str(g.get('_uid')) == str(u)])
         return nid
     nid = F.mutate(fn)
-    return F.payload(c, id=nid, code=0, cdnUrl='', sensitiveWords=[])
+    return F.payload(c, id=nid, code=0, cdnUrl=saved_cdn, sensitiveWords=[])
 
 # ============================ 账号资料 / 生命周期 ============================
 @F.register('game_updateuserinfo')
@@ -153,6 +216,17 @@ def h_updateuserinfo(req):
         v = F.param(req, src)
         if v is not None:
             patch[dst] = str(v)[:120] if isinstance(v, str) else v
+    # 昵称/签名/简介敏感词检测（个人资料公开展示）
+    try:
+        import agentsrv as _asrv
+        _txt = ' '.join(str(x) for k, x in patch.items()
+                        if k in ('userName', 'userIntro', 'sign'))
+        _hits = _asrv.sensitive_check(_txt) if _txt.strip() else []
+        if _hits:
+            return F.payload('game_updateuserinfo', code=1, msg='资料含敏感词，请修改',
+                             result=False, success=False, sensitiveWords=_hits)
+    except Exception:
+        pass
     def fn(ft, db):
         us = db.get('users', {})
         if isinstance(us, dict) and str(u) in us and patch:

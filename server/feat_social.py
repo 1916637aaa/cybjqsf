@@ -168,6 +168,18 @@ def h_comment(req):
     cmd = (req.get('_cmd') if isinstance(req, dict) else '') or F.param(req, 'cmd') or 'game_commenttalk'
     kind = 'game' if cmd == 'game_commentgame' else 'talk'
     parent = F.as_int(F.first(req, 0, 'commentId', 'replayCommentId', 'parentId'), 0)
+    # 评论/回复同样过敏感词三路检测（发帖已接，评论此前遗漏）
+    try:
+        import agentsrv as _asrv
+        _c = F.first(req, '', 'content', 'msg', 'reviewStr', 'text')
+        if isinstance(_c, dict):
+            _c = _c.get('text', '') or _c.get('msg', '')
+        _hits = _asrv.sensitive_check(str(_c or ''))
+        if _hits:
+            return F.payload(cmd, comment={}, code=1, msg='内容含敏感词，请修改后发表',
+                             success=False, result=False, sensitiveWords=_hits)
+    except Exception as _e:
+        pass   # 检测异常一律放行，不影响评论主流程
     def fn(ft, db):
         rec, tid, content = _new_comment(ft, req, kind, parent)
         cnt = len([c for c in ft['comments'] if c.get('_kind') == kind and
@@ -234,6 +246,16 @@ def h_delcomment(req):
 def h_modifycomment(req):
     cid = str(F.first(req, '', 'commentId', 'id'))
     content = str(F.first(req, '', 'content', 'msg', 'reviewStr') or '')[:500]
+    # 修改评论：敏感词检测（避免先发正常再改成违规）
+    try:
+        import agentsrv as _asrv
+        _hits = _asrv.sensitive_check(content)
+        if _hits:
+            return F.payload('game_modifytalkcomment', comment={}, code=1,
+                             msg='内容含敏感词，请修改后再提交',
+                             result=False, success=False, sensitiveWords=_hits)
+    except Exception:
+        pass
     def fn(ft, db):
         for c in ft.get('comments', []):
             if str(c.get('id')) == cid:
@@ -247,12 +269,29 @@ def h_modifycomment(req):
 def h_reportcomment(req):
     cmd = (req.get('_cmd') if isinstance(req, dict) else '') or F.param(req, 'cmd') or 'game_reporttalkcomment'
     cid = str(F.first(req, '', 'commentId', 'id'))
+    reason = str(F.first(req, '', 'reason', 'msg', 'content') or '')[:200]
     def fn(ft, db):
+        n = 0
+        target_type, target_id, owner_uid, content = 'talk', '', '', ''
         for c in ft.get('comments', []):
             if str(c.get('id')) == cid:
                 c['reportCnt'] = F.as_int(c.get('reportCnt'), 0) + 1
-                return c['reportCnt']
-        return 0
+                n = c['reportCnt']
+                target_type = str(c.get('_kind') or 'talk')
+                target_id = str(c.get('_target') or c.get('talkId') or c.get('gameId') or '')
+                owner_uid = str(c.get('playerId') or '')
+                content = str(c.get('content') or '')[:120]
+                break
+        # 评论举报也进 reports，后台统一处理；不重复叠加同一人同一评论的举报
+        rid = F.next_id(ft, 'report')
+        ft.setdefault('reports', []).append({
+            'id': rid, 'kind': 'comment', 'targetId': cid,
+            'targetType': target_type, 'targetOwner': owner_uid, 'content': content,
+            'uid': F.uid(), 'userName': F.uname(), 'reason': reason,
+            'stamp': F.now_ms(), 'status': 0,
+        })
+        ft['reports'] = ft['reports'][-300:]
+        return n
     n = F.mutate(fn)
     return F.payload(cmd, reportCnt=n)
 

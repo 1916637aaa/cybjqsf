@@ -180,6 +180,15 @@ def h_send(req):
     # 空消息/未指定对端：不落库（探针、回归的空请求会走到这里）
     if not opp or not content.strip():
         return F.payload(c, id=0, code=0)
+    # 私信敏感词检测（与发帖/评论同一套三路）；命中不落库
+    try:
+        import agentsrv as _asrv
+        _hits = _asrv.sensitive_check(content)
+        if _hits:
+            return F.payload(c, id=0, code=1, msg='内容含敏感词，无法发送',
+                             result=False, success=False, sensitiveWords=_hits)
+    except Exception:
+        pass
 
     me = _me()
     me_id = F.as_int(me.get('id'), 0)

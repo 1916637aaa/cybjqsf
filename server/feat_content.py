@@ -102,6 +102,18 @@ def h_modifytalk(req):
     if isinstance(simple, dict): patch['simpleContent'] = simple
     elif simple is not None: patch['simpleContent'] = {'text': str(simple)[:500]}
     if isinstance(content, dict): patch['content'] = content
+    # 修改动态：敏感词检测（避免先发正常再改成违规）
+    try:
+        import agentsrv as _asrv
+        _txt = title + ' ' + str((patch.get('simpleContent') or {}).get('text', '')
+                                 if isinstance(patch.get('simpleContent'), dict)
+                                 else patch.get('simpleContent') or '')
+        _hits = _asrv.sensitive_check(_txt)
+        if _hits:
+            return F.payload(c, code=1, msg='内容含敏感词，请修改后再提交',
+                             result=False, success=False, sensitiveWords=_hits)
+    except Exception:
+        pass
     t = F.patch_talk(tid, patch) or F.find_talk(tid) or {}
     return F.payload(c, code=0, talkData=t, sensitiveWords=[])
 
@@ -215,17 +227,46 @@ def h_gamedetail(req):
     ft = F.load_feat()
     # 用 comment_list（含置顶优先），让「置顶评论」真正生效
     cs = [F.comment_obj(ft, x, 'game') for x in F.comment_list(ft, 'game', gid, 0)][:20]
+    # ★ 修复：作者必须是作品的真实发布者(_uid)，不能用当前登录用户。
+    # 否则看别人的作品时，作者显示成自己、点进去跳自己主页。
     try:
         import store
-        u = store.current_user() or {}
-        author = F.user_simple({'userId': u.get('userId'), 'userName': u.get('userName'),
-                                'userImg': u.get('userImg'), 'userIntro': u.get('userIntro'),
+        db_all = store.load_db()
+        users = db_all.get('users', {}) if isinstance(db_all, dict) else {}
+        g_before = _game_by_id(gid) or {}
+        author_uid = str(g_before.get('_uid') or g_before.get('authorId') or '')
+        u = users.get(author_uid) if isinstance(users, dict) and author_uid else None
+        if not isinstance(u, dict):
+            u = {'userId': F.as_int(author_uid, 0), 'userName': ''}
+        author = F.user_simple({'userId': u.get('userId', F.as_int(author_uid, 0)),
+                                'userName': u.get('userName') or ('玩家' + author_uid[-4:]),
+                                'userImg': u.get('userImg'), 'userIntro': u.get('userIntro') or u.get('sign'),
                                 'level': u.get('level')})
+        # ★ 客户端 GameCoverScene 用 authorMsg.id 当 roleId 跳作者主页；
+        # user_simple 只回 playerId，缺失 id 会导致 roleId=0 -> 显示成当前登录用户。
+        if isinstance(author, dict):
+            author['id'] = F.as_int(author.get('playerId') or author_uid, 0)
     except Exception:
         author = {}
+    # 补齐客户端 GameCoverScene 实际会读取的展示字段：
+    #   isThumb/isCollection/isPlay/isHurry(按钮态) / tagList(标签) / dataVersion / gDGiftScoreInfo
+    # 缺失时 setValue 会取类型默认值，界面虽然不崩但「点赞/收藏/标签」显示不完整。
+    # gameDataCdnUrl：作品发布时由客户端上传的工程 .bin 文件名，存于作品记录；
+    # 无上传作品（内置 seed）则为空，客户端 onPlayBtn 会安全返回不崩。
+    g = dict(g) if isinstance(g, dict) else {}
+    g.setdefault('tagList', [])
+    g.setdefault('isThumb', False)
+    g.setdefault('isCollection', False)
+    g.setdefault('isPlay', False)
+    g.setdefault('isHurry', False)
+    g.setdefault('gDGiftScoreInfo', {})
+    g.setdefault('dataVersion', 0)
+    g.setdefault('openData', {})
+    g.setdefault('gameDataCdnUrl', '')
+    rank = list(ft.get('ranks', {}).get(str(gid), []))[:10]
     return F.payload('game_getgamedetail', authorMsg=author, releaseGameData=g,
                      creativeGameData={}, gameTopComment=cs[0] if cs else {},
-                     rankList=[], id=F.as_int(gid, 0))
+                     rankList=rank, id=F.as_int(gid, 0))
 
 
 def post_process(cmd, payload, req):
@@ -237,7 +278,18 @@ def post_process(cmd, payload, req):
             ft = F.load_feat()
             rec = ft.get('credit', {}).get(uid, {}) or {}
             score = F.as_int(rec.get('score'), 100)
-            msgs = rec.get('list', []) or []
+            msgs = list(rec.get('list', []) or [])
+            # 封号号(叶子=0)：在信誉明细顶部注入醒目封禁提示。
+            # 客户端叶子只读登录瞬间且不刷新，这里让信誉页明确显示封禁状态。
+            if score <= 0:
+                try:
+                    import time as _t
+                    _tip = {'score': 0,
+                            'reason': '⚠ 账号已被封禁：叶子扣至0，全部功能受限',
+                            'stamp': int(_t.time() * 1000)}
+                    msgs = [_tip] + msgs
+                except Exception:
+                    pass
             payload['creditScore'] = score
             payload['creditScoreRecoverProcess'] = 0
             payload['userCreditMsgList'] = msgs[:20]
@@ -356,13 +408,20 @@ def _report(req, kind, c):
 @F.register('game_reportgame', 'game_reportgoods', 'game_reportplayer', 'game_reporttalk')
 def h_report(req):
     c = cmd(req, 'game_reportgame')
-    kind = ('game' if 'game' in c else 'goods' if 'goods' in c else
-            'player' if 'player' in c else 'talk')
+    # ★ 修复：所有举报命令都带 game_ 前缀，'game' in c 永远为真，导致全归成作品。
+    # 必须按完整命令名精确匹配。
+    _kinds = {
+        'game_reportgame': 'game',
+        'game_reportgoods': 'goods',
+        'game_reportplayer': 'player',
+        'game_reporttalk': 'talk',
+    }
+    kind = _kinds.get(c, 'game')
     return _report(req, kind, c)
 
 @F.register('game_revokereportgame', 'game_revokereportgoods', 'game_revokereportplayer',
             'game_revokereportgamecomment', 'game_dealwithreportgamecomment',
-            'game_dealwithreportgoods', 'game_dealwithreportplayer')
+            'game_dealwithreportgoods')
 def h_revoke(req):
     c = cmd(req, 'game_revokereportgame')
     rid = str(F.first(req, '', 'id', 'reportId'))
@@ -371,6 +430,78 @@ def h_revoke(req):
             if str(r.get('id')) == rid: r['status'] = 2
     F.mutate(fn)
     return F.payload(c, id=F.as_int(rid, 0))
+
+
+@F.register('game_dealwithreportplayer')
+def h_dealwithreportplayer(req):
+    """GM 处理玩家举报（APP 里用户主页「封号/处罚」按钮）：
+    - score<0 扣目标信誉分(叶子)，扣到 0 即封号；
+    - needReset* 重置 昵称/头像/简介；
+    - 信誉分归 0 时写 kick.jsonl，agentsrv 立即踢掉该 uid 全部在线连接并拒绝重连。
+    """
+    c = cmd(req, 'game_dealwithreportplayer')
+    target = str(F.first(req, '', 'id', 'targetId', 'playerId', 'userId'))
+    reason = str(F.first(req, '', 'reason') or '')[:200]
+    try:
+        score = int(F.param(req, 'score', 0) or 0)
+    except Exception:
+        score = 0
+    reset_name = bool(F.param(req, 'needResetUserName', False))
+    reset_img = bool(F.param(req, 'needResetUserImg', False))
+    reset_intro = bool(F.param(req, 'needResetIntro', False))
+    new_score = [None]
+    banned = [False]
+
+    def fn(ft, db):
+        if not target or target == '0':
+            return
+        # 信誉分：0~3 叶子等级点
+        rec = ft.setdefault('credit', {}).setdefault(target, {'score': 3, 'list': []})
+        old = F.as_int(rec.get('score'), 3)
+        new = max(0, min(3, old + score)) if score else old
+        rec['score'] = new
+        new_score[0] = new
+        if score:
+            rec.setdefault('list', []).append({
+                'score': score, 'reason': reason or ('GM处罚 ' + c),
+                'stamp': F.now_ms(),
+            })
+            rec['list'] = rec['list'][-50:]
+        u = db.get('users', {}).get(target)
+        if isinstance(u, dict):
+            # 同步 creditScore 字段
+            if score:
+                u['creditScore'] = new
+            # 重置违规资料
+            if reset_name:
+                u['userName'] = '玩家' + target[-4:]
+            if reset_img:
+                u['userImg'] = '/uploads/cover/avatar.png'
+                u['newUserImg'] = ''
+                u['imgReviewStatus'] = 0
+            if reset_intro:
+                u['userIntro'] = '这个人很懒，什么都没写'
+        if new <= 0 and (score < 0 or old <= 0):
+            banned[0] = True
+        # 把举报标记已处理
+        for r in ft.get('reports', []):
+            if str(r.get('targetId')) == target or str(r.get('uid')) == target:
+                r['status'] = 2
+        return new
+
+    F.mutate(fn)
+    # 封号：写踢线指令，agentsrv 轮询后立即断开该 uid 全部连接并拒绝重连
+    if banned[0] and target and target != '0':
+        try:
+            import json, time
+            kick = '/opt/privsrv/data/kick.jsonl'
+            with open(kick, 'a', encoding='utf8') as f:
+                f.write(json.dumps({'uid': target, 'reason': reason or 'GM封号'},
+                                   ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+    return F.payload(c, id=F.as_int(target, 0), score=new_score[0] or 0)
+
 
 @F.register('game_clearreportgame', 'game_clearreportgoods', 'game_clearreportplayer',
             'game_clearreporttalk', 'game_clearreporttalkcomment', 'game_clearreportgamecomment')

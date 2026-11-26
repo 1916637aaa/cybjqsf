@@ -110,7 +110,6 @@ seed(db)
 
 # ---------------------------------------------------------------- 响应封装
 
-# 游戏自身域名/IP：命中则按游戏协议(lz4/bon)编码，第三方 SDK 走普通 JSON。
 # 本机公网 IP 从 conf/privsrv.env 注入，不写死任何特定地址。
 GAME_HOSTS = ('cysj.hortorgames.com', 'localhost', '127.0.0.1')
 _my_ip = os.environ.get('PRIVSRV_IP', '').strip()
@@ -327,14 +326,11 @@ def bon_encode(v):
 #   e[2] = (e[2]&0xAA) | t 的高 4 位（放在 bit6/4/2/0）
 #   e[3] = (e[3]&0xAA) | t 的低 4 位
 def lz4_xor_encode(data, key=None):
-    import subprocess as _sp, shutil as _sh
+    import subprocess as _sp
     data = bytes(data)
-    # 主路径：用 node + lz4js 复刻客户端 lz4XorEncode，与 App 原生解码 100% 兼容。
-    # node 路径从 PATH 查找（可用 NODE_BIN 覆盖），脚本路径相对本文件，换机器无需改代码。
-    _node = os.environ.get('NODE_BIN') or _sh.which('node') or 'node'
-    _lxjs = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lx_lz4.js')
+    # 主路径：用 node + lz4js 复刻客户端 lz4XorEncode，与 App 原生解码 100% 兼容
     try:
-        p = _sp.run([_node, _lxjs],
+        p = _sp.run(['/usr/local/node/bin/node', '/opt/privsrv/lx_lz4.js'],
                     input=data.hex().encode('ascii'),
                     capture_output=True, timeout=30)
         if p.returncode == 0 and p.stdout:
@@ -561,6 +557,49 @@ def try_decode(raw_bytes):
     return None, None
 
 
+def decode_lx_body(raw_bytes):
+    """解客户端 lz4XorEncode 请求体（'pl' 头 + 异或密钥藏在前4字节），返回明文；失败返回 ''。"""
+    if not raw_bytes or len(raw_bytes) < 8 or bytes(raw_bytes[:2]) != b'pl':
+        return ''
+    try:
+        e = bytearray(raw_bytes)
+        t = (((e[2] >> 6) & 1) << 7) | (((e[2] >> 4) & 1) << 6) | \
+            (((e[2] >> 2) & 1) << 5) | ((e[2] & 1) << 4) | \
+            (((e[3] >> 6) & 1) << 3) | (((e[3] >> 4) & 1) << 2) | \
+            (((e[3] >> 2) & 1) << 1) | (e[3] & 1)
+        b = bytearray(b'\x04\x22\x4d\x18')
+        n = min(100, len(e))
+        for i in range(4, n):
+            b.append(e[i] ^ t)
+        b.extend(e[n:])
+        import lz4.frame
+        return lz4.frame.decompress(bytes(b)).decode('utf8', 'replace')
+    except Exception:
+        return ''
+
+
+def lx_body_fields(raw_bytes):
+    """从 authusersingle 的 lx 体里提取本次登录的 userId / phone / visitorUId / token。"""
+    import re as _re
+    out = {}
+    txt = decode_lx_body(raw_bytes)
+    if not txt:
+        return out
+    m = _re.search(r'"userId"\s*:\s*"?(\d{4,10})"?', txt)
+    if m:
+        out['userId'] = m.group(1)
+    m = _re.search(r'"phone"\s*:\s*"([^"]{1,40})"|"phone"\s*:\s*(\d{6,20})', txt)
+    if m:
+        out['phone'] = m.group(1) or m.group(2)
+    m = _re.search(r'(UD-[0-9a-fA-F-]{20,})', txt)
+    if m:
+        out['deviceId'] = m.group(1)
+    m = _re.search(r'(?i)"?token"?\s*[:=]\s*"?([0-9a-f]{32})"?', txt)
+    if m:
+        out['token'] = m.group(1)
+    return out
+
+
 def log_req(handled_by):
     try:
         raw_b = request.get_data(cache=True) or b''
@@ -585,8 +624,15 @@ def log_req(handled_by):
                   'user-agent', 'accept', 'accept-language'):
             continue
         keep[k] = v[:200]
+    # [IPLOG] 真实来源 IP：代理注入的 X-Real-IP / X-Forwarded-For，兜底 remote_addr
+    _xr = (request.headers.get('X-Real-IP') or '').strip()
+    _xff = [x.strip() for x in (request.headers.get('X-Forwarded-For') or '').split(',')
+            if x.strip() and x.strip() not in ('127.0.0.1', '::1')]
+    _cip = (_xr if _xr and _xr not in ('127.0.0.1', '::1') else None) \
+           or (_xff[-1] if _xff else None) or request.remote_addr or '?'
     rec = {
         'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+        'ip': _cip,
         'host': request.host,
         'method': request.method,
         'path': request.path,
@@ -660,30 +706,50 @@ def h_login(path):
         uid = str(user['userId'])
         db = store.load_db()
     elif is_authuser:
-        tok = str(get_param('token', 'accessToken', 'roleToken', default='') or '')
+        # [multiuser-fix-v3] authusersingle 的凭据在 lz4Xor 编码的二进制 body 里，
+        # get_param 取不到；此前一律回退到写死的 13800000000(=账号1000020)，
+        # 导致所有人无论输什么手机号都登成 1000020 —— 这是本次串号根因。
+        # 现在解开 body，用本次登录服务端刚下发的 info.userId/phone 定位账号。
+        raw_body = request.get_data(cache=True) or b''
+        fields = lx_body_fields(raw_body)
+        tok = str(get_param('token', 'accessToken', 'roleToken', default='') or fields.get('token', ''))
         _tid, tu = store.user_by_token(tok) if tok else ('', None)
-        if not tu:
-            tu = store.current_user()          # 上一次手机号登录已 set_current
+        if not tu and fields.get('userId'):
+            tu = store.load_db()['users'].get(str(fields['userId']))
+        if not tu and fields.get('phone'):
+            _uid = store.load_db().get('phoneMap', {}).get(str(fields['phone']), '')
+            tu = store.load_db()['users'].get(_uid) if _uid else None
+        _dev = fields.get('deviceId') or str(get_param('deviceId', 'deviceID', 'udid', default='') or '')
+        if not tu and _dev:
+            tu = store.user_by_device(_dev)
         if tu:
             uid = str(tu['userId'])
             store.set_current(uid)
+            if _dev:
+                store.bind_device(uid, _dev)
             user = dict(store.load_db()['users'].get(uid) or tu)
         else:
-            user, _is_new = store.register_or_login('13800000000', name)
+            # [guest-no-record] 完全身份不明的静默登录 -> 内存游客 uid=0，不写账号表、
+            # 不占正式 ID。真人手机号登录走 phone 分支拿真实账号，有设备绑定者走上面 tu 分支。
+            user = store.guest_user()
             uid = str(user['userId'])
+            store.set_current(uid)
         db = store.load_db()
     else:
-        # 其它登录类请求（appLoginSwitch 等）：沿用当前/最近用户，没有就建默认账号
-        tu = store.current_user()
-        if not tu:
-            _d = store.load_db()
-            _last = _d.get('lastUser') or (list(_d['users'])[-1] if _d['users'] else '')
-            tu = _d['users'].get(_last) if _last else None
+        # [multiuser-fix-v2] login/token：token 有效就用它；失效时用 deviceId 建/找独立账号，
+        # 绝不回退全局 current_user()(那会把每个设备都登成最后登录的人 = 串号根因)。
+        tok = str(get_param('token', 'accessToken', 'roleToken', default='') or '')
+        _tid, tu = store.user_by_token(tok) if tok else ('', None)
+        _dev = str(get_param('deviceId', 'deviceID', 'udid', default='') or '')
+        if not tu and _dev:
+            tu = store.user_by_device(_dev)
         if tu:
             uid = str(tu['userId'])
-            user = dict(tu)
+            user = dict(store.load_db()['users'].get(uid) or tu)
         else:
-            user, _is_new = store.register_or_login('13800000000', name)
+            # [guest-no-record] token 失效且设备未绑定 -> 内存游客 uid=0，不写账号表、
+            # 不占正式 ID。真人登录走 v4/login 的 phone 分支拿真实账号。
+            user = store.guest_user()
             uid = str(user['userId'])
         db = store.load_db()
     token = store.issue_token(uid)
@@ -692,17 +758,21 @@ def h_login(path):
     if 'authusersingle' in path or 'authuser' in path:
         mode = lx_mode()
         raw_body = request.get_data()
+        # [guest-no-formal-flag] 游客占位号（身份不明兜底）不发放正式账号标识。
+        # 判定依据：只有兜底游客号用固定 phone __guest_placeholder__，真人号均为真实手机号。
+        _is_guest = (str(user.get('phone', '')) == '__guest_placeholder__')
         payload = dict(user)
         payload.update({
             'token': token, 'sessionId': token, 'accessToken': token,
             # 客户端随后用 roleToken 建立 /agent 的 WebSocket 连接
             'roleToken': token, 'roleId': user['userId'],
-            'isNew': False, 'isNewUser': False, 'needBind': False,
-            # 正式账号标记：orangeLogin() 读 decBody.bindInfo / bindPlatformUId，
-            # 让「我的」页显示正式账号、bindPlatformUId 落地（不影响登录主链）。
-            'bindInfo': {'bindType': 'app-mobile', 'bindPlatformUId': user['uniqueId']},
-            'bindPlatformUId': user['uniqueId'],
-            'isAppVisitor': False,
+            'isNew': False, 'isNewUser': False,
+            # 游客号保持 needBind=True，让客户端认作游客、引导去绑定/登录；真人号 False。
+            'needBind': _is_guest,
+            # 正式账号标记：仅真人号发放；游客号去掉，避免冒充正式账号。
+            'bindInfo': ({} if _is_guest else {'bindType': 'app-mobile', 'bindPlatformUId': user['uniqueId']}),
+            'bindPlatformUId': ('' if _is_guest else user['uniqueId']),
+            'isAppVisitor': _is_guest,
             # 私服：已实名成年（SDK 原生实名框不再弹）
             'realName': True, 'realNamed': True, 'isRealName': True,
             'authed': True, 'isAdult': True,
@@ -822,11 +892,13 @@ def h_login(path):
     data = login_payload(user, token)
     # 私服：所有登录类响应（appLoginSwitch / login/token 等）都声明已实名成年，
     # roleLogin() 里 C.Ins.realNamed = o.realName，发动态/发布作品门禁由此放行。
+    # [guest-no-formal-flag] 游客号不冒充正式账号。
+    _is_guest_data = (str(user.get('phone', '')) == '__guest_placeholder__')
     data.update({
         'realName': True, 'realNamed': True, 'isRealName': True,
         'authed': True, 'isAdult': True,
         'brithDay': '1990-01-01', 'birthDay': '1990-01-01',
-        'birthday': '1990-01-01', 'isAppVisitor': False, 'needBind': False,
+        'birthday': '1990-01-01', 'isAppVisitor': _is_guest_data, 'needBind': _is_guest_data,
     })
     data.setdefault('userInfo', user)   # login_payload 已带，双保险
     return ok(data, realName=True, realNamed=True, isRealName=True,

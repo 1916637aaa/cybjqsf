@@ -1,3 +1,11 @@
+import contextvars
+# 每个 WebSocket 连接绑定的会话用户 id（asyncio 任务/协程隔离），修复多人串号
+SESSION_UID = contextvars.ContextVar('privsrv_session_uid', default='')
+def set_session_uid(uid): return SESSION_UID.set(str(uid) if uid else '')
+def get_session_uid(): return SESSION_UID.get('')
+def clear_session_uid(token=None):
+    try: SESSION_UID.reset(token) if token is not None else SESSION_UID.set('')
+    except Exception: SESSION_UID.set('')
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """私服共享数据层：用户库 / 动态库 / 会话。跨进程安全（flock + 原子替换）。
@@ -18,9 +26,12 @@ DB_FILE = os.path.join(DATA, 'db.json')
 TALK_FILE = os.path.join(DATA, 'talks.json')
 os.makedirs(DATA, exist_ok=True)
 
+TOKEN_TTL = 7 * 24 * 3600   # token 有效期 7 天（秒）
+
 DEFAULT_DB = {
     'users': {},        # userId -> user dict
     'tokens': {},       # token  -> userId
+    'tokenTimes': {},   # token  -> 签发时间戳(秒)，用于 7 天过期校验；旧token无记录则视为长期有效
     'phoneMap': {},     # phone  -> userId
     'lastUser': '',     # 最近登录 userId
     'currentUid': '',   # 当前游戏会话 userId（authusersingle 时写，agentsrv 读）
@@ -100,6 +111,17 @@ def default_user(uid, phone='', name=None):
         'followCount': 0, 'fansCount': 0, 'workCount': 0,
     }
 
+# [guest-no-record] 游客虚拟 uid：不入库、不占正式账号 ID；客户端 role 需数字 id，用 0 表示无账号。
+GUEST_UID = '0'
+
+def guest_user():
+    """游客临时账号（纯内存对象，不写 users 表、不分配 new_user_id）。"""
+    u = default_user(GUEST_UID, '__guest_placeholder__', '游客')
+    u['userId'] = GUEST_UID
+    u['uniqueId'] = 'pf_' + GUEST_UID
+    return u
+
+
 def new_user_id(db):
     n = 1000000
     for k in db['users']:
@@ -111,13 +133,40 @@ def issue_token(uid):
     tok = hashlib.md5(('%s|%s|%s' % (uid, time.time(), uuid.uuid4())).encode()).hexdigest()
     f = _lock()
     try:
-        db = _fresh_db(); db['tokens'][tok] = str(uid); _atomic(DB_FILE, db)
+        db = _fresh_db()
+        db['tokens'][tok] = str(uid)
+        db.setdefault('tokenTimes', {})[tok] = time.time()   # 记录签发时间，7天有效期
+        # 顺带清理已过期的 token（惰性清理，避免无限累积）
+        _purge_expired_tokens(db)
+        _atomic(DB_FILE, db)
     finally: _unlock(f)
     return tok
+
+def _purge_expired_tokens(db):
+    """删除超过 TOKEN_TTL 的 token；无时间记录的旧 token 不动（向后兼容）。"""
+    try:
+        now = time.time()
+        tt = db.get('tokenTimes') or {}
+        expired = [t for t, ts in tt.items()
+                   if isinstance(ts, (int, float)) and (now - float(ts)) > TOKEN_TTL]
+        for t in expired:
+            db['tokens'].pop(t, None)
+            tt.pop(t, None)
+    except Exception:
+        pass
 
 def user_by_token(tok):
     db = load_db()
     uid = db['tokens'].get(tok, '')
+    if not uid:
+        return '', None
+    # 7 天有效期校验：有签发记录且超期 -> 视为无效
+    ts = (db.get('tokenTimes') or {}).get(tok)
+    if isinstance(ts, (int, float)) and (time.time() - float(ts)) > TOKEN_TTL:
+        return '', None
+    # [guest-no-record] 游客虚拟 uid 不在 users 表，返回内存游客对象
+    if str(uid) == GUEST_UID:
+        return uid, guest_user()
     return uid, (db['users'].get(uid) if uid else None)
 
 def register_or_login(phone, name=None):
@@ -145,6 +194,27 @@ def register_or_login(phone, name=None):
     finally:
         _unlock(f)
 
+def user_by_device(dev):
+    """按 deviceId 找绑定账号，找不到返回 None。"""
+    if not dev:
+        return None
+    db = load_db()
+    uid = (db.get('deviceMap') or {}).get(str(dev), '')
+    return db['users'].get(uid) if uid else None
+
+def bind_device(uid, dev):
+    """把 deviceId 绑定到账号(仅首次，不覆盖已有绑定)。"""
+    if not dev:
+        return
+    f = _lock()
+    try:
+        db = _fresh_db()
+        dm = db.setdefault('deviceMap', {})
+        dm.setdefault(str(dev), str(uid))
+        _atomic(DB_FILE, db)
+    finally:
+        _unlock(f)
+
 def set_current(uid):
     """authusersingle 成功时设定当前游戏会话用户。"""
     f = _lock()
@@ -155,10 +225,14 @@ def set_current(uid):
     finally: _unlock(f)
 
 def current_user():
-    """agentsrv game_login 用：当前会话用户 dict 或 None（异常返回 None）。"""
+    """当前会话用户：优先用本连接的 SESSION_UID，回退全局 currentUid。"""
     try:
         db = load_db()
-        uid = db.get('currentUid') or db.get('lastUser')
+        suid = get_session_uid()
+        uid = suid or db.get('currentUid') or db.get('lastUser')
+        # [guest-no-record] 游客虚拟 uid 不在 users 表，返回内存游客对象
+        if str(uid) == GUEST_UID:
+            return guest_user()
         return db['users'].get(uid) if uid else None
     except Exception:
         return None
